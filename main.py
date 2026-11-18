@@ -22,6 +22,12 @@ one of those, 1 otherwise. The forecast is then
 
 with the five scored levels 0.05 / 0.25 / 0.5 / 0.75 / 0.95.
 
+Fallback: an hour no comparable has data for -- or a case with no
+comparables at all -- is forecast with the house baseline's persistence
+formula (p1 with a random-walk spread widening in log space), so the entry
+degrades to the baseline instead of borrowing another hour's shape or
+going flat.
+
 Runs offline on Python 3.13, standard library only, fully deterministic:
 every iteration is over sorted lists, no randomness, no dict-order dependence.
 
@@ -46,6 +52,11 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+
+# House baseline (starter) spread, used ONLY as a fallback: persistence at
+# hour 1 with a random-walk spread in log space, sigma 0.15 per sqrt hour.
+BASELINE_SIGMA = 0.15
+BASELINE_Z = [-1.645, -0.674, 0, 0.674, 1.645]
 
 # A comparable only counts if its hour-1 print is a real launch print, not a
 # pre-unlock trickle: games whose global unlock falls hours after midnight UTC
@@ -167,10 +178,9 @@ def weighted_quantile(pairs, tau):
     return pts[-1][0]
 
 
-def hour_forecast(p1, ratios):
-    """The five quantiles for one hour, from its (log-ratio, weight) pairs."""
-    qs = [p1 * math.exp(weighted_quantile(ratios, tau)) for tau in LEVELS]
-    # Enforce the spec: finite, > 0, <= 1e9, non-decreasing, 2-decimal half-up.
+def clean_quantiles(qs):
+    """Enforce the spec on five raw quantiles: finite, > 0, <= 1e9,
+    non-decreasing, rounded to 2 decimals half-up."""
     cleaned = []
     floor = 0.01
     for q in qs:
@@ -187,6 +197,25 @@ def hour_forecast(p1, ratios):
     return cleaned
 
 
+def hour_forecast(p1, ratios):
+    """The five quantiles for one hour, from its (log-ratio, weight) pairs."""
+    qs = [p1 * math.exp(weighted_quantile(ratios, tau)) for tau in LEVELS]
+    return clean_quantiles(qs)
+
+
+def persistence_forecast(p1, h):
+    """House-baseline fallback for one hour: persistence at p1 with a
+    random-walk spread widening in log space (sigma 0.15 per sqrt hour).
+
+    Used only when no comparable has log-ratio data for that hour, or the
+    case has no comparables at all. In that situation the honest forecast
+    is the baseline itself: it keeps the entry valid and degrades to the
+    house score instead of borrowing another hour's shape or going flat.
+    """
+    qs = [p1 * math.exp(z * BASELINE_SIGMA * math.sqrt(h - 1)) for z in BASELINE_Z]
+    return clean_quantiles(qs)
+
+
 def forecast_case(case, name="case"):
     """Forecast hours 2..24 of one case: {"hours": [{"hour": h, "q": [...]}]}."""
     levels = case.get("levels") or LEVELS
@@ -198,20 +227,17 @@ def forecast_case(case, name="case"):
     p1 = max(1.0, float(first["viewers"]))
 
     by_hour = collect_log_ratios(case.get("comparables") or [])
-    # Fallback for an hour with no comparable data at all: reuse the nearest
-    # hour that has data (shape continuity); if none has data, stay at p1.
-    available = sorted(h for h, pairs in by_hour.items() if pairs)
     hours = []
     for row in case.get("forecast") or []:
         h = int(row["hour"])
         pairs = by_hour.get(h) or []
-        if not pairs and available:
-            nearest = min(available, key=lambda a: (abs(a - h), a))
-            pairs = by_hour[nearest]
         if pairs:
             q = hour_forecast(p1, pairs)
         else:
-            q = [round_half_up_2(p1)] * len(LEVELS)
+            # No comparable has log-ratio data for this hour -- or the case
+            # has no comparables at all -- so this hour falls back to the
+            # house baseline persistence forecast, not a borrowed shape.
+            q = persistence_forecast(p1, h)
         hours.append({"hour": h, "q": q})
     hours.sort(key=lambda r: r["hour"])
     return {"hours": hours}
